@@ -1,3 +1,149 @@
+use std::{
+    cell::RefCell,
+    collections::VecDeque,
+    marker::PhantomData,
+    pin::pin,
+    rc::Rc,
+    sync::Arc,
+    task::{Context, Poll, Wake},
+    thread::Thread,
+};
+
+use crate::count_fut::CounterFut;
+
+pub mod count_fut;
+
+pub struct Runtime {
+    scheduler: Rc<CurrentThreadScheduler>,
+    handle: Handle,
+}
+
+pub struct CurrentThreadScheduler {
+    core: Rc<Core>,
+}
+
+struct Core {
+    task: RefCell<VecDeque<Task>>,
+}
+
+pub struct Task {}
+
+pub struct JoinHandle<T> {
+    _phantom: PhantomData<T>,
+}
+
+pub struct Handle {
+    scheduler: Rc<CurrentThreadScheduler>,
+}
+
+/*
+ *
+ * ===== impl Runtime =====
+ *
+ */
+impl Runtime {
+    fn new() -> Self {
+        let scheduler = Rc::new(CurrentThreadScheduler {
+            core: Rc::new(Core::new()),
+        });
+        let handle = Handle {
+            scheduler: scheduler.clone(),
+        };
+        Self { scheduler, handle }
+    }
+
+    fn spawn<Fut>(&self, fut: Fut) -> JoinHandle<Fut::Output>
+    where
+        Fut: Future,
+    {
+        // pin future
+        let fut = Box::pin(fut);
+        // convert to task
+        // schedule task(push to queue)
+        todo!()
+    }
+
+    fn block_on<Fut>(&self, fut: Fut) -> Fut::Output
+    where
+        Fut: Future + Clone,
+    {
+        // create runtime context
+        let thread = std::thread::current();
+        let waker = Arc::new(ThreadWaker { thread }).into();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut fut = pin!(fut);
+
+        'outer: loop {
+            // poll given future
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(v) => return v,
+                Poll::Pending => {}
+            }
+
+            // poll enqueued task
+            // if empty park
+            'inner: loop {
+                match self.scheduler.core.task.borrow_mut().pop_front() {
+                    Some(task) => {
+                        task.run();
+                        continue 'inner;
+                    }
+                    None => {
+                        // FIXME: verify notified before park
+                        std::thread::park();
+                        continue 'outer;
+                    }
+                };
+            }
+        }
+    }
+}
+
+/*
+ *
+ * ===== impl Core =====
+ *
+ */
+
+impl Core {
+    fn new() -> Self {
+        Self {
+            task: RefCell::new(VecDeque::default()),
+        }
+    }
+}
+
+/*
+ *
+ * ===== impl Task =====
+ *
+ */
+impl Task {
+    fn run(&self) {
+        todo!()
+    }
+}
+
+/*
+ *
+ * ===== Waker =====
+ *
+ */
+struct ThreadWaker {
+    thread: Thread,
+}
+
+impl Wake for ThreadWaker {
+    fn wake(self: Arc<Self>) {
+        self.thread.unpark();
+    }
+}
+
 fn main() {
-    println!("Hello, world!");
+    let rt = Runtime::new();
+    let count_fut = CounterFut::new(4);
+
+    let result = rt.block_on(count_fut);
+    println!("block_on result: {}", result);
 }

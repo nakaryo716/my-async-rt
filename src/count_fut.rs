@@ -20,7 +20,6 @@ impl Future for CounterFut {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.curr == self.target {
-            println!("now {}", self.curr);
             Poll::Ready(self.curr)
         } else {
             self.curr += 1;

@@ -4,7 +4,10 @@ use std::{
     marker::PhantomData,
     pin::pin,
     rc::Rc,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll, Wake},
     thread::Thread,
 };
@@ -69,7 +72,12 @@ impl Runtime {
     {
         // create runtime context
         let thread = std::thread::current();
-        let waker = Arc::new(ThreadWaker { thread }).into();
+        let notified = Arc::new(AtomicBool::new(false));
+        let waker = Arc::new(ThreadWaker {
+            thread,
+            notified: notified.clone(),
+        })
+        .into();
         let mut cx = Context::from_waker(&waker);
 
         let mut fut = pin!(fut);
@@ -90,7 +98,9 @@ impl Runtime {
                         continue 'inner;
                     }
                     None => {
-                        // FIXME: verify notified before park
+                        if notified.load(Ordering::Acquire) {
+                            continue 'outer;
+                        }
                         std::thread::park();
                         continue 'outer;
                     }
@@ -132,11 +142,18 @@ impl Task {
  */
 struct ThreadWaker {
     thread: Thread,
+    notified: Arc<AtomicBool>,
 }
 
 impl Wake for ThreadWaker {
     fn wake(self: Arc<Self>) {
-        self.thread.unpark();
+        if self
+            .notified
+            .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.thread.unpark();
+        }
     }
 }
 

@@ -2,8 +2,8 @@ use std::{
     cell::RefCell,
     collections::VecDeque,
     marker::PhantomData,
-    pin::pin,
-    rc::Rc,
+    pin::{Pin, pin},
+    rc::{Rc, Weak},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -29,14 +29,20 @@ struct Core {
     task: RefCell<VecDeque<Task>>,
 }
 
-pub struct Task {}
+pub struct Task {
+    future: Pin<Box<dyn Future<Output = ()>>>,
+}
 
 pub struct JoinHandle<T> {
     _phantom: PhantomData<T>,
 }
 
 pub struct Handle {
-    scheduler: Rc<CurrentThreadScheduler>,
+    scheduler: Weak<CurrentThreadScheduler>,
+}
+
+pub enum RtError {
+    ShutDown,
 }
 
 /*
@@ -50,25 +56,31 @@ impl Runtime {
             core: Rc::new(Core::new()),
         });
         let handle = Handle {
-            scheduler: scheduler.clone(),
+            scheduler: Rc::downgrade(&scheduler),
         };
         Self { scheduler, handle }
     }
 
-    fn spawn<Fut>(&self, fut: Fut) -> JoinHandle<Fut::Output>
+    fn spawn<Fut>(&self, fut: Fut) -> Result<(), RtError>
     where
-        Fut: Future,
+        Fut: Future<Output = ()> + 'static,
     {
-        // pin future
-        let fut = Box::pin(fut);
-        // convert to task
-        // schedule task(push to queue)
-        todo!()
+        let task = Task {
+            future: Box::pin(fut),
+        };
+
+        let scheduler = match self.handle.scheduler.upgrade() {
+            Some(scheduler) => scheduler,
+            None => return Err(RtError::ShutDown),
+        };
+        let mut task_queue = scheduler.core.task.borrow_mut();
+        task_queue.push_back(task);
+        Ok(())
     }
 
     fn block_on<Fut>(&self, fut: Fut) -> Fut::Output
     where
-        Fut: Future + Clone,
+        Fut: Future,
     {
         // create runtime context
         let thread = std::thread::current();
@@ -92,9 +104,12 @@ impl Runtime {
             // poll enqueued task
             // if empty park
             'inner: loop {
-                match self.scheduler.core.task.borrow_mut().pop_front() {
-                    Some(task) => {
-                        task.run();
+                let mut queue = self.scheduler.core.task.borrow_mut();
+                match queue.pop_front() {
+                    Some(mut task) => {
+                        if task.run(&mut cx).is_pending() {
+                            queue.push_back(task);
+                        }
                         continue 'inner;
                     }
                     None => {
@@ -130,8 +145,8 @@ impl Core {
  *
  */
 impl Task {
-    fn run(&self) {
-        todo!()
+    fn run(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        self.future.as_mut().poll(cx)
     }
 }
 
@@ -159,8 +174,22 @@ impl Wake for ThreadWaker {
 
 fn main() {
     let rt = Runtime::new();
-    let count_fut = CounterFut::new(4);
 
-    let result = rt.block_on(count_fut);
-    println!("block_on result: {}", result);
+    let future = async {
+        let _ = rt.spawn(async move {
+            let count_fut = CounterFut::new(4);
+            println!("task1 {}", count_fut.await);
+        });
+
+        let _ = rt.spawn(async move {
+            let count_fut2 = CounterFut::new(2);
+            println!("task2 {}", count_fut2.await);
+        });
+
+        let count_fut3 = CounterFut::new(1);
+        let val = count_fut3.await;
+        println!("block on {}", val)
+    };
+
+    rt.block_on(future);
 }

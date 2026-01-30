@@ -1,14 +1,13 @@
 use std::{
     cell::RefCell,
     collections::VecDeque,
-    marker::PhantomData,
     pin::{Pin, pin},
     rc::{Rc, Weak},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    task::{Context, Poll, Wake},
+    task::{Context, Poll, Wake, Waker},
     thread::Thread,
 };
 
@@ -31,16 +30,19 @@ struct Core {
 
 pub struct Task {
     future: Pin<Box<dyn Future<Output = ()>>>,
+    waker: Rc<RefCell<Option<Waker>>>,
 }
 
 pub struct JoinHandle<T> {
-    _phantom: PhantomData<T>,
+    data: Rc<RefCell<Option<T>>>,
+    waker: Rc<RefCell<Option<Waker>>>,
 }
 
 pub struct Handle {
     scheduler: Weak<CurrentThreadScheduler>,
 }
 
+#[derive(Debug)]
 pub enum RtError {
     ShutDown,
 }
@@ -61,13 +63,26 @@ impl Runtime {
         Self { scheduler, handle }
     }
 
-    fn spawn<Fut>(&self, fut: Fut) -> Result<(), RtError>
+    fn spawn<Fut, T>(&self, fut: Fut) -> Result<JoinHandle<T>, RtError>
     where
-        Fut: Future<Output = ()> + 'static,
+        Fut: Future<Output = T> + 'static,
+        T: Send + 'static,
     {
+        let data = Rc::new(RefCell::new(None));
+        let data_c = data.clone();
+
+        let waker = Rc::new(RefCell::new(None));
+        let waker_c = waker.clone();
+
         let task = Task {
-            future: Box::pin(fut),
+            future: Box::pin(async move {
+                let val = fut.await;
+                *data_c.borrow_mut() = Some(val);
+            }),
+            waker: waker_c,
         };
+
+        let handle = JoinHandle { data, waker };
 
         let scheduler = match self.handle.scheduler.upgrade() {
             Some(scheduler) => scheduler,
@@ -75,7 +90,7 @@ impl Runtime {
         };
         let mut task_queue = scheduler.core.task.borrow_mut();
         task_queue.push_back(task);
-        Ok(())
+        Ok(handle)
     }
 
     fn block_on<Fut>(&self, fut: Fut) -> Fut::Output
@@ -107,8 +122,13 @@ impl Runtime {
                 let mut queue = self.scheduler.core.task.borrow_mut();
                 match queue.pop_front() {
                     Some(mut task) => {
-                        if task.run(&mut cx).is_pending() {
-                            queue.push_back(task);
+                        match task.run(&mut cx) {
+                            Poll::Ready(_) => {
+                                if let Some(waker) = task.waker.borrow_mut().take() {
+                                    waker.wake();
+                                }
+                            }
+                            Poll::Pending => queue.push_back(task),
                         }
                         continue 'inner;
                     }
@@ -172,23 +192,39 @@ impl Wake for ThreadWaker {
     }
 }
 
+/*
+ *
+ * ===== impl JoinHandle =====
+ *
+ */
+
+impl<T> Future for JoinHandle<T> {
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.data.borrow_mut().take() {
+            Some(v) => Poll::Ready(v),
+            None => {
+                *self.waker.borrow_mut() = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+}
+
 fn main() {
     let rt = Runtime::new();
 
     let future = async {
-        let _ = rt.spawn(async move {
-            let count_fut = CounterFut::new(4);
-            println!("task1 {}", count_fut.await);
-        });
+        let task1 = rt.spawn(CounterFut::new(4)).unwrap();
 
-        let _ = rt.spawn(async move {
-            let count_fut2 = CounterFut::new(2);
-            println!("task2 {}", count_fut2.await);
-        });
+        let task2 = rt.spawn(CounterFut::new(3)).unwrap();
 
-        let count_fut3 = CounterFut::new(1);
-        let val = count_fut3.await;
-        println!("block on {}", val)
+        println!("{}", task1.await);
+        println!("{}", task2.await);
+
+        let val = CounterFut::new(2);
+        println!("{}", val.await);
     };
 
     rt.block_on(future);
